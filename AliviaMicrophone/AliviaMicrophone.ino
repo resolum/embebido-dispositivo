@@ -1,337 +1,119 @@
 /**
- * Alivia Voice - ESP32 #1: microfono INMP441 (I2S) sobre el framework ModestIoT.
+ * Alivia Voice - ESP32 #1: microfono INMP441 + parlante MAX98357A sobre ModestIoT.
  *
- * Microfono INMP441 + parlante MAX98357A conectados al edge de voz por WebSocket (ws://<host>:<puerto>/ws,
- * contrato en docs/protocolo-websocket.md). Envia PCM 16 kHz / 16 bit / mono y reproduce el audio de respuesta.
+ * Todo lo hace el framework ModestIoT: este sketch solo declara pines, red y transporte.
  *
- * Arquitectura (ModestIoT):
- *   Inmp441Microphone (Sensor)   -> tarea de captura I2S propia (core 1), estadisticas y VAD
- *   MicrophoneDevice  (Device)   -> scheduler por timer y telemetria (Serial y WebSocket)
- *   EdgeLink                     -> WiFi + WebSocket, hello, reconexion con backoff (core 0)
- *   AudioStreamer                -> cola de frames del microfono -> WebSocket (core 0)
- *   Max98357Speaker  (Actuator)  -> jitter buffer + reproduccion I2S (core 0)
+ *   Inmp441Microphone  (Sensor)    microfono I2S, captura, VAD y niveles
+ *   Max98357Speaker    (Actuator)  parlante I2S con jitter buffer
+ *   WebSocketGatewayClient         enlace por WiFi   (hijo de StreamGatewayClient)
+ *   BluetoothStreamGatewayClient   enlace por Bluetooth Classic (hijo de StreamGatewayClient)
+ *   VoiceNodeDevice    (Device)    une todo: scheduler, telemetria, envio del audio y consola serie
+ *
+ * El audio viaja por el MISMO enlace en los dos sentidos: el microfono sube PCM al edge y el edge devuelve
+ * el audio generado, que suena en el parlante. Sin internet: solo WiFi local o Bluetooth.
+ *
+ * ENLACE CON EL EDGE (lo que debe coincidir, ver docs/protocolo-websocket.md):
+ *   - hello = { type, deviceId, mac, capabilities, micSampleRate, playbackSampleRate, bits, channels, frameSamples, token }
+ *   - mac   = MAC del ESP32 (AA:BB:CC:DD:EE:FF). Es lo que identifica al dispositivo ante la tabla de acceso del
+ *             backend: debe estar registrado como MICROPHONE en estado IN_USE. Se imprime al arrancar.
+ *   - token = ALIVIA_WS_TOKEN / [server].token del edge.   - host/puerto/ruta = [server] del edge.
+ *   - audio = PCM 16 kHz, 16 bit, mono; tramas de 1280 B (640 muestras, 40 ms).
+ *
+ * ModestIoT esta copiado en libraries/ModestIoT con el parche de la MAC en StreamGatewayClient (ver docs/modestiot.md).
+ *
+ * Elegir transporte: cambia USE_BLUETOOTH (0 = WiFi/WebSocket, 1 = Bluetooth).
+ *   - WiFi:      el edge corre en una PC (Windows o Mac) en la misma red; EDGE_HOST es la IP de esa PC.
+ *   - Bluetooth: empareja la PC con "BT_DEVICE_NAME". Windows: puerto COM saliente del emparejamiento.
+ *                Mac: /dev/cu.<BT_DEVICE_NAME>. Placa con "Huge APP" (WiFi y Bluetooth no caben en la
+ *                particion por defecto).
  *
  * Requisitos:
  *   - Placa: ESP32 Dev Module (ESP32 clasico). Core "esp32" de Espressif 3.x.
- *   - Librerias: ArduinoJson 7.x y WebSockets 2.7.x (Markus Sattler / Links2004). La capa de scheduler
- *     ModestIoT esta en esta carpeta.
- *   - Secrets.h: copia Secrets.example.h y rellena WiFi, host del edge y token (esta ignorado por git).
- *   - Monitor serie a 115200 baudios, fin de linea "Ninguno" o "Nueva linea".
+ *   - Librerias: ModestIoT (libraries/ModestIoT del repo, con sus dependencias), ArduinoJson 7.x y WebSockets 2.7.x.
+ *   - Monitor serie a 115200 baudios. Comandos: h ayuda, s estado, v vumetro, j JSON, + / - ganancia,
+ *     w enlace, t tono de prueba, r prueba de 3 s, R WAV (tools/grabar_wav.py).
  *
- * Comandos por el monitor serie (una letra + Enter):
- *   h  ayuda           s  estado            v  vumetro en vivo on/off
- *   +  ganancia +3 dB  -  ganancia -3 dB    j  JSON de telemetria on/off
- *   w  estado del enlace   t  tono de prueba por el parlante
- *   r  prueba de 3 s analizada en el ESP32 (pico, nivel, recortes, veredicto)
- *   R  graba 3 s y envia un WAV binario (usar tools/grabar_wav.py, no el monitor)
+ * Sin el dispositivo: tools/simulate_node.py del edge hace de este ESP32 (mismo protocolo).
  */
 
-#include "Device.h"
-#include <WiFi.h>
-#include <esp_heap_caps.h>
+#include <ModestIoT.h>
 
-#include "AudioStreamer.h"
-#include "EdgeLink.h"
-#include "Inmp441Microphone.h"
-#include "Max98357Speaker.h"
-#include "MicrophoneConfig.h"
-#include "MicrophoneDevice.h"
-#include "SerialConsole.h"
+// ---------------------------------------------------------------------------
+// Configuracion
+// ---------------------------------------------------------------------------
+#ifndef USE_BLUETOOTH
+#define USE_BLUETOOTH 0   // 0 = WiFi + WebSocket, 1 = Bluetooth Classic (SPP)
+#endif
+
+static constexpr const char* DEVICE_ID = "alivia-mic-01";   // etiqueta para logs; NO identifica al dispositivo
+
+// Credenciales (WIFI_SSID, WIFI_PASSWORD, EDGE_HOST, EDGE_TOKEN): Secrets.h, ignorado por git.
+// Copia Secrets.example.h como Secrets.h y rellenalo. Sin Secrets.h el sketch no compila.
 #include "Secrets.h"
 
+static constexpr uint16_t    EDGE_PORT      = 8765;            // [server].port
+static constexpr const char* EDGE_PATH      = "/ws";           // [server].path
+static constexpr const char* BT_DEVICE_NAME = "Alivia-Mic-01";
+
+// Pines (sin cambios)
+static constexpr int MICROPHONE_SCK_PIN = 27;
+static constexpr int MICROPHONE_WS_PIN  = 14;
+static constexpr int MICROPHONE_SD_PIN  = 2;
+static constexpr int SPEAKER_BCLK_PIN   = 26;
+static constexpr int SPEAKER_LRC_PIN    = 25;
+static constexpr int SPEAKER_DIN_PIN    = 22;
+
+// Audio: debe coincidir con el edge (PCM 16 kHz, 16 bit, mono)
+static constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;
+static constexpr unsigned long SCHEDULER_TICK_MS = 100;
+static constexpr unsigned long SERIAL_BAUD_RATE = 115200;
+
 // ---------------------------------------------------------------------------
-// Objetos del framework (el I2S se inicia en setup(), no en los constructores)
+// Objetos del framework (el hardware se inicia en setup(), no en los constructores)
 // ---------------------------------------------------------------------------
+static StreamGatewayClient::Settings linkSettings() {
+    StreamGatewayClient::Settings settings;
+    settings.deviceId = DEVICE_ID;        // la MAC del hello la agrega StreamGatewayClient
+    settings.token = EDGE_TOKEN;
+    settings.micSampleRate = AUDIO_SAMPLE_RATE;
+    settings.playbackSampleRate = AUDIO_SAMPLE_RATE;
+    settings.frameSamples = Inmp441Microphone::FRAME_SAMPLES;
+    return settings;
+}
+
+#if USE_BLUETOOTH
+BluetoothConnectivityDriver connectivity(BT_DEVICE_NAME);
+BluetoothStreamGatewayClient edgeLink(connectivity, linkSettings());
+#else
+WiFiConnectivityDriver connectivity(WIFI_SSID, WIFI_PASSWORD);
+WebSocketGatewayClient edgeLink(connectivity, EDGE_HOST, EDGE_PORT, EDGE_PATH, linkSettings());
+#endif
+
 Inmp441Microphone microphone(MICROPHONE_SCK_PIN, MICROPHONE_WS_PIN, MICROPHONE_SD_PIN, AUDIO_SAMPLE_RATE);
-MicrophoneDevice microphoneDevice(DEVICE_ID, microphone, SCHEDULER_TICK_MS);
-EdgeLink edgeLink(WIFI_SSID, WIFI_PASSWORD, EDGE_HOST, EDGE_PORT, EDGE_PATH, DEVICE_ID, EDGE_TOKEN);
-Max98357Speaker speaker(SPEAKER_BCLK_PIN, SPEAKER_LRC_PIN, SPEAKER_DIN_PIN, PLAYBACK_SAMPLE_RATE, edgeLink);
-AudioStreamer audioStreamer(microphone, edgeLink);
-
-bool liveMeterEnabled = false;
-bool microphoneReady = false;
-unsigned long lastMeterTimestamp = 0;
-
-// ---------------------------------------------------------------------------
-// Utilidades de grabacion
-// ---------------------------------------------------------------------------
-
-/** Reserva el buffer mas grande posible hasta `seconds` (usa PSRAM si la placa la tiene). */
-int16_t* allocateRecordingBuffer(uint32_t seconds, size_t& sampleCount) {
-    sampleCount = static_cast<size_t>(seconds) * AUDIO_SAMPLE_RATE;
-    auto* buffer = static_cast<int16_t*>(heap_caps_malloc(sampleCount * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (buffer != nullptr) return buffer;
-
-    // Sin PSRAM: el bloque libre mas grande de la RAM interna suele rondar 100 KB (~3 s).
-    const size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    const size_t reserve = 16 * 1024;  // dejar aire para Serial, JSON y las tareas
-    size_t fitting = largestBlock > reserve ? (largestBlock - reserve) / sizeof(int16_t) : 0;
-    fitting -= fitting % Inmp441Microphone::FRAME_SAMPLES;
-    if (fitting < sampleCount) sampleCount = fitting;
-    if (sampleCount < AUDIO_SAMPLE_RATE / 2) return nullptr;  // menos de 0.5 s no sirve
-    return static_cast<int16_t*>(heap_caps_malloc(sampleCount * sizeof(int16_t), MALLOC_CAP_8BIT));
-}
-
-/** Llena `buffer` con audio nuevo del microfono. Devuelve las muestras grabadas. */
-size_t recordInto(int16_t* buffer, size_t sampleCount) {
-    if (!microphone.startRecording(buffer, sampleCount)) return 0;
-    const unsigned long timeout = (sampleCount * 1000UL) / AUDIO_SAMPLE_RATE + 2000;
-    const unsigned long start = millis();
-    while (microphone.isRecording() && millis() - start < timeout) {
-        delay(20);
-    }
-    const size_t recorded = microphone.getRecordedSampleCount();
-    microphone.cancelRecording();
-    return recorded;
-}
-
-float toDbfs(float amplitude) {
-    return amplitude <= 0.0f ? -120.0f : 20.0f * log10f(amplitude / 32768.0f);
-}
-
-void runTestRecording() {
-    size_t samples = 0;
-    int16_t* buffer = allocateRecordingBuffer(TEST_RECORDING_SECONDS, samples);
-    if (buffer == nullptr) {
-        SerialConsole::printf("[Prueba] Sin memoria para grabar.\n");
-        return;
-    }
-    SerialConsole::printf("[Prueba] Grabando %.1f s... HABLA AHORA (di \"alivia, prende la luz\").\n",
-                          static_cast<float>(samples) / AUDIO_SAMPLE_RATE);
-    const size_t recorded = recordInto(buffer, samples);
-
-    int peak = 0;
-    uint32_t clipped = 0;
-    double sumOfSquares = 0.0;
-    double sum = 0.0;
-    for (size_t i = 0; i < recorded; ++i) {
-        const int value = buffer[i];
-        const int magnitude = abs(value);
-        if (magnitude > peak) peak = magnitude;
-        if (magnitude >= 32767) ++clipped;
-        sumOfSquares += static_cast<double>(value) * value;
-        sum += value;
-    }
-    free(buffer);
-
-    if (recorded == 0) {
-        SerialConsole::printf("[Prueba] No llego audio. Revisa el estado en las lineas [Mic].\n");
-        return;
-    }
-    const float rms = static_cast<float>(sqrt(sumOfSquares / recorded));
-    const float mean = static_cast<float>(sum / recorded);
-    const float peakDbfs = toDbfs(static_cast<float>(peak));
-
-    SerialConsole::printf("[Prueba] muestras=%u  pico=%d (%.1f dBFS)  nivel=%.1f dBFS  recortes=%lu  DC=%.1f\n",
-                          static_cast<unsigned>(recorded), peak, peakDbfs, toDbfs(rms),
-                          static_cast<unsigned long>(clipped), mean);
-
-    if (peak == 0) {
-        SerialConsole::printf("[Prueba] Veredicto: SOLO CEROS. Revisa SD, VDD (3.3V), GND y L/R.\n");
-    } else if (clipped > recorded / 1000) {
-        SerialConsole::printf("[Prueba] Veredicto: RECORTA. Baja la ganancia con '-' (ahora %.0f dB).\n",
-                              microphone.getGainInDecibels());
-    } else if (peakDbfs < -45.0f) {
-        SerialConsole::printf("[Prueba] Veredicto: MUY BAJO. Habla mas cerca o sube la ganancia con '+'.\n");
-    } else if (peakDbfs < -25.0f) {
-        SerialConsole::printf("[Prueba] Veredicto: BAJO pero usable. Para el edge conviene un pico de -25 a -6 dBFS.\n");
-    } else {
-        SerialConsole::printf("[Prueba] Veredicto: OK. Buen nivel para Vosk/Whisper.\n");
-    }
-}
-
-void writeLittleEndian(uint8_t* destination, uint32_t value, int bytes) {
-    for (int i = 0; i < bytes; ++i) destination[i] = static_cast<uint8_t>(value >> (8 * i));
-}
-
-/** Graba y envia un WAV por Serial entre marcadores, para tools/grabar_wav.py. */
-void sendWavRecording() {
-    size_t samples = 0;
-    int16_t* buffer = allocateRecordingBuffer(WAV_RECORDING_SECONDS, samples);
-    if (buffer == nullptr) {
-        SerialConsole::printf("@@ALIVIA_WAV_ERROR sin_memoria\n");
-        return;
-    }
-    SerialConsole::printf("@@ALIVIA_WAV_RECORDING seconds=%.1f\n", static_cast<float>(samples) / AUDIO_SAMPLE_RATE);
-    const size_t recorded = recordInto(buffer, samples);
-    const uint32_t dataBytes = recorded * sizeof(int16_t);
-
-    uint8_t header[44];
-    memcpy(header, "RIFF", 4);
-    writeLittleEndian(header + 4, 36 + dataBytes, 4);
-    memcpy(header + 8, "WAVEfmt ", 8);
-    writeLittleEndian(header + 16, 16, 4);                    // tamano del bloque fmt
-    writeLittleEndian(header + 20, 1, 2);                     // PCM
-    writeLittleEndian(header + 22, 1, 2);                     // mono
-    writeLittleEndian(header + 24, AUDIO_SAMPLE_RATE, 4);
-    writeLittleEndian(header + 28, AUDIO_SAMPLE_RATE * 2, 4); // bytes por segundo
-    writeLittleEndian(header + 32, 2, 2);                     // bytes por muestra
-    writeLittleEndian(header + 34, 16, 2);                    // bits por muestra
-    memcpy(header + 36, "data", 4);
-    writeLittleEndian(header + 40, dataBytes, 4);
-
-    SerialConsole::beginExclusive();
-    Serial.printf("\n@@ALIVIA_WAV_BEGIN size=%lu rate=%lu\n",
-                  static_cast<unsigned long>(sizeof(header) + dataBytes), static_cast<unsigned long>(AUDIO_SAMPLE_RATE));
-    Serial.write(header, sizeof(header));
-    const auto* bytes = reinterpret_cast<const uint8_t*>(buffer);
-    for (uint32_t offset = 0; offset < dataBytes; offset += 512) {
-        Serial.write(bytes + offset, min<uint32_t>(512, dataBytes - offset));
-    }
-    Serial.print("\n@@ALIVIA_WAV_END\n");
-    SerialConsole::endExclusive();
-    free(buffer);
-}
-
-// ---------------------------------------------------------------------------
-// Consola
-// ---------------------------------------------------------------------------
-void printHelp() {
-    SerialConsole::printf(
-        "\nComandos:\n"
-        "  h  ayuda                 s  estado\n"
-        "  v  vumetro en vivo       j  JSON de telemetria\n"
-        "  +  ganancia +3 dB        -  ganancia -3 dB\n"
-        "  w  estado del enlace     t  tono de prueba (parlante)\n"
-        "  r  prueba de %lu s (habla durante la prueba)\n"
-        "  R  enviar WAV al PC (solo con tools/grabar_wav.py)\n\n",
-        static_cast<unsigned long>(TEST_RECORDING_SECONDS));
-}
-
-void printStatus() {
-    const AudioLevelReport report = microphone.getLastReport();
-    SerialConsole::printf(
-        "[Estado] pines SCK=%d WS=%d SD=%d | %lu Hz | canal %s | ganancia %.0f dB | estado %s\n"
-        "[Estado] %s\n"
-        "[Estado] heap libre %u B, bloque mayor %u B, PSRAM %u B\n",
-        MICROPHONE_SCK_PIN, MICROPHONE_WS_PIN, MICROPHONE_SD_PIN, static_cast<unsigned long>(AUDIO_SAMPLE_RATE),
-        microphone.getActiveSlot() == 0 ? "L" : microphone.getActiveSlot() == 1 ? "R" : "?",
-        microphone.getGainInDecibels(), Inmp441Microphone::describeStatus(report.status),
-        Inmp441Microphone::describeStatusHint(report.status),
-        static_cast<unsigned>(ESP.getFreeHeap()),
-        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
-        static_cast<unsigned>(ESP.getFreePsram()));
-}
-
-void printLinkStatus() {
-    const LinkStats link = edgeLink.stats();
-    const SpeakerStats sound = speaker.stats();
-    SerialConsole::printf(
-        "[Enlace] estado %s | WiFi %s, IP %s, RSSI %d dBm | edge ws://%s:%u%s\n"
-        "[Enlace] enviado %lu B, recibido %lu B | reconexiones %lu, intentos fallidos %lu\n"
-        "[Enlace] mic: %lu mensajes de audio enviados | descartados sin enlace %lu, fallos de envio %lu, cola del mic %lu\n"
-        "[Parlante] volumen %u%% | buffer %lu/%lu B | %s | enunciados %lu, underruns %lu, desbordado %lu B, cancelados %lu\n"
-        "[Heap] libre %u B, bloque mayor %u B, minimo historico %u B\n",
-        EdgeLink::describeState(edgeLink.state()), WiFi.status() == WL_CONNECTED ? "OK" : "sin conexion",
-        WiFi.localIP().toString().c_str(), WiFi.RSSI(), edgeLink.host(), edgeLink.port(), EDGE_PATH,
-        static_cast<unsigned long>(link.bytesSent), static_cast<unsigned long>(link.bytesReceived),
-        static_cast<unsigned long>(link.reconnects), static_cast<unsigned long>(link.handshakeFailures),
-        static_cast<unsigned long>(link.micFramesSent), static_cast<unsigned long>(link.micFramesDroppedNoLink),
-        static_cast<unsigned long>(link.micFramesDroppedSendFail), static_cast<unsigned long>(link.micQueueDrops),
-        static_cast<unsigned>(speaker.getVolumePercent()), static_cast<unsigned long>(sound.bufferedBytes),
-        static_cast<unsigned long>(sound.bufferCapacityBytes), sound.playing ? "sonando" : "en silencio",
-        static_cast<unsigned long>(sound.utterances), static_cast<unsigned long>(sound.underruns),
-        static_cast<unsigned long>(sound.overflowBytes), static_cast<unsigned long>(sound.cancelled),
-        static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
-        static_cast<unsigned>(ESP.getMinFreeHeap()));
-}
-
-void changeGain(float deltaInDecibels) {
-    microphone.setGainInDecibels(microphone.getGainInDecibels() + deltaInDecibels);
-    SerialConsole::printf("[Mic] Ganancia: %.0f dB\n", microphone.getGainInDecibels());
-}
-
-void handleSerialCommand(char command) {
-    switch (command) {
-        case 'h': case '?': printHelp(); break;
-        case 's': printStatus(); break;
-        case 'v':
-            liveMeterEnabled = !liveMeterEnabled;
-            microphoneDevice.setReportsVisible(!liveMeterEnabled);
-            SerialConsole::printf("[Mic] Vumetro en vivo: %s\n", liveMeterEnabled ? "ON" : "OFF");
-            break;
-        case 'j':
-            microphoneDevice.setJsonOutputEnabled(!microphoneDevice.isJsonOutputEnabled());
-            SerialConsole::printf("[Mic] JSON: %s\n", microphoneDevice.isJsonOutputEnabled() ? "ON" : "OFF");
-            break;
-        case '+': changeGain(3.0f); break;
-        case '-': changeGain(-3.0f); break;
-        case 'w': printLinkStatus(); break;
-        case 't':
-            SerialConsole::printf("[Parlante] Tono de prueba: debes oirlo por el parlante.\n");
-            speaker.handle(Max98357Speaker::PLAY_TEST_TONE_COMMAND);
-            break;
-        case 'r': runTestRecording(); break;
-        case 'R': sendWavRecording(); break;
-        case '\r': case '\n': case ' ': break;
-        default: SerialConsole::printf("[Mic] Comando desconocido '%c'. Escribe h.\n", command); break;
-    }
-}
-
-void printLiveMeter() {
-    const float level = microphone.getInstantLevelInDbfs();
-    char bar[41];
-    int filled = static_cast<int>((level + 90.0f) / 90.0f * 40.0f + 0.5f);
-    filled = constrain(filled, 0, 40);
-    for (int i = 0; i < 40; ++i) bar[i] = i < filled ? '#' : '.';
-    bar[40] = '\0';
-    SerialConsole::printf("[VU] %s %6.1f dBFS %s\n", bar, level, microphone.isVoiceActive() ? "VOZ" : "");
-}
+Max98357Speaker speaker(SPEAKER_BCLK_PIN, SPEAKER_LRC_PIN, SPEAKER_DIN_PIN, AUDIO_SAMPLE_RATE);
+VoiceNodeDevice voiceNode(DEVICE_ID, microphone, speaker, edgeLink, SCHEDULER_TICK_MS);
 
 // ---------------------------------------------------------------------------
 void setup() {
     SerialConsole::begin(SERIAL_BAUD_RATE);
     delay(300);
-    SerialConsole::printf("\n=== Alivia Voice | ESP32 #1 microfono INMP441 | ModestIoT ===\n");
-
-    microphone.setGainInDecibels(MICROPHONE_GAIN_DB);
-    microphone.setVoiceThresholdInDecibels(VOICE_THRESHOLD_DB);
-    microphone.setVoiceHangoverInMilliseconds(VOICE_HANGOVER_MS);
-    microphone.setReportIntervalInMilliseconds(LEVEL_REPORT_INTERVAL_MS);
-
-    // The frame queue must exist before the capture task starts (AudioStreamer drains it).
-    microphone.enableFrameQueue(MIC_QUEUE_FRAMES);
-
-    if (!microphone.begin(MICROPHONE_CHANNEL)) {
-        SerialConsole::printf("[Boot] ERROR: no se pudo iniciar I2S. Revisa los pines y que el core ESP32 sea 3.x.\n");
-        return;
-    }
-    microphoneReady = true;
-    microphoneDevice.begin();
-
-    // Speaker and link: if any fails the microphone keeps working over Serial as before.
-    microphoneDevice.attachLink(&edgeLink);
-    edgeLink.setListener(&speaker);
-    if (!speaker.begin()) {
-        SerialConsole::printf("[Boot] ERROR: no se pudo iniciar el parlante (BCLK=%d LRC=%d DIN=%d).\n",
-                              SPEAKER_BCLK_PIN, SPEAKER_LRC_PIN, SPEAKER_DIN_PIN);
-    }
-    if (!edgeLink.begin() || !audioStreamer.begin()) {
-        SerialConsole::printf("[Boot] ERROR: no se pudo iniciar el enlace con el edge.\n");
-    }
-
-    SerialConsole::printf("[Boot] Microfono listo: %lu Hz, 16 bit, mono. SCK=%d WS=%d SD=%d, ganancia %.0f dB\n",
-                          static_cast<unsigned long>(AUDIO_SAMPLE_RATE), MICROPHONE_SCK_PIN, MICROPHONE_WS_PIN,
-                          MICROPHONE_SD_PIN, microphone.getGainInDecibels());
-    SerialConsole::printf("[Boot] Parlante: BCLK=%d LRC=%d DIN=%d, %lu Hz, volumen %u%%. Enlace: %s -> ws://%s:%u%s\n",
-                          SPEAKER_BCLK_PIN, SPEAKER_LRC_PIN, SPEAKER_DIN_PIN, static_cast<unsigned long>(PLAYBACK_SAMPLE_RATE),
-                          static_cast<unsigned>(SPEAKER_VOLUME_PERCENT), WIFI_SSID, EDGE_HOST, EDGE_PORT, EDGE_PATH);
-    printHelp();
+    SerialConsole::printf("\n=== Alivia Voice | ESP32 #1 microfono INMP441 + parlante MAX98357A | ModestIoT ===\n");
+    char deviceMac[18];
+    StreamGatewayClient::baseMacAddress(deviceMac, sizeof(deviceMac));
+    SerialConsole::printf("MAC (registrala en el backend como MICROPHONE): %s\n", deviceMac);
+#if USE_BLUETOOTH
+    SerialConsole::printf("Transporte: Bluetooth SPP como \"%s\" (en el edge: [[bluetooth.links]] mac = \"%s\")\n", BT_DEVICE_NAME, deviceMac);
+#else
+    SerialConsole::printf("Transporte: WiFi \"%s\" -> ws://%s:%u%s\n", WIFI_SSID, EDGE_HOST, (unsigned)EDGE_PORT, EDGE_PATH);
+#endif
+    voiceNode.begin();
 }
 
 void loop() {
-    if (!microphoneReady) {
+    if (!voiceNode.isReady()) {
         delay(1000);
         return;
     }
-
-    while (Serial.available() > 0) {
-        handleSerialCommand(static_cast<char>(Serial.read()));
-    }
-
-    if (liveMeterEnabled && millis() - lastMeterTimestamp >= SCHEDULER_TICK_MS) {
-        lastMeterTimestamp = millis();
-        printLiveMeter();
-    }
+    voiceNode.service();
     delay(10);
 }

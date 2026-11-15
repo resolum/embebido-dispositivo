@@ -17,7 +17,7 @@ WebSocket y reproduce por el mismo enlace la voz de respuesta. El contrato está
 | SD | GPIO 2 | | SD, GAIN | sin conectar |
 
 Los pines del micrófono no cambian. El parlante usa el segundo puerto I2S del ESP32 clásico (el micrófono usa el
-primero). Todos los pines están en [`AliviaMicrophone/MicrophoneConfig.h`](AliviaMicrophone/MicrophoneConfig.h).
+primero). Todos los pines están al inicio de [`AliviaMicrophone/AliviaMicrophone.ino`](AliviaMicrophone/AliviaMicrophone.ino).
 GPIO 2 (SD del micrófono) es un pin de arranque: si falla la carga del firmware, desconecta SD mientras flasheas.
 
 ### Alimentación del amplificador
@@ -29,7 +29,7 @@ tensión de una fuente débil: se oye como ruido y puede reiniciar el ESP32.
   y el regulador de 3V3 del ESP32 también debe sostener los picos de WiFi.
 - Usa una fuente USB de **1 A o más** y un cable corto y grueso. Un puerto USB de PC viejo puede quedarse corto.
 - Pon un capacitor de **470 µF a 1000 µF** entre VIN y GND del amplificador, lo más cerca posible de él.
-- `SPEAKER_VOLUME_PERCENT` (por defecto 60) limita el nivel de salida; bájalo si ves reinicios o ruido.
+- `SpeakerSettings::volumePercent` (por defecto 60) limita el nivel de salida; bájalo si ves reinicios o ruido.
 
 ### Separación entre micrófono y parlante
 
@@ -39,46 +39,54 @@ pero conviene ayudarle desde lo físico:
 - Separa micrófono y parlante al menos **10 a 15 cm**, con el orificio del micrófono mirando **lejos** del parlante.
 - No los pongas en la misma cavidad de la carcasa; aísla el micrófono con espuma o goma de las vibraciones.
 - Mantén el cableado del micrófono (SCK, WS, SD) lejos del cable del amplificador.
-- La ganancia del micrófono se ajusta con `MICROPHONE_GAIN_DB` o en vivo con `+` y `-`.
+- La ganancia del micrófono se ajusta con `VoiceNodeSettings::microphoneGainDb` o en vivo con `+` y `-`.
 
 ## Librerías y compilación
 
 - Placa: **ESP32 Dev Module**, core `esp32:esp32` de Espressif **3.x** (probado con 3.3.8).
-- Librerías: **ArduinoJson 7.x** y **WebSockets 2.7.x** (Markus Sattler / `arduinoWebSockets`).
-  La capa de scheduler tipo ModestIoT ya está en la carpeta del sketch.
+- Framework: **ModestIoT**, copiado en [`libraries/ModestIoT`](libraries/ModestIoT) con un parche que añade la MAC al
+  `hello`. Detalle, dependencias y uso de memoria en [`docs/modestiot.md`](docs/modestiot.md).
 
 ```bash
-arduino-cli lib install ArduinoJson WebSockets
+arduino-cli lib install ArduinoJson WebSockets PubSubClient "DHT sensor library" ESP32Servo "LiquidCrystal I2C" HX711
 cp AliviaMicrophone/Secrets.example.h AliviaMicrophone/Secrets.h     # y edítalo
-arduino-cli compile --fqbn esp32:esp32:esp32 AliviaMicrophone
+arduino-cli compile --fqbn esp32:esp32:esp32 --library libraries/ModestIoT AliviaMicrophone
 arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/cu.usbserial-XXXX AliviaMicrophone
 ```
 
-Resultado de la compilación con core 3.3.8: 1 151 883 bytes de flash (87 % de la partición `default`, 1 310 720 bytes)
-y 54 480 bytes de RAM estática (16 %). Si añades funciones y te quedas sin flash, elige el esquema de particiones
-`Huge APP` en el IDE (`--board-options PartitionScheme=huge_app`).
+WiFi ocupa el 91 % de la partición `default`. Para Bluetooth (`USE_BLUETOOTH 1`) hace falta el esquema `Huge APP`:
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 --board-options PartitionScheme=huge_app \
+  --build-property "compiler.cpp.extra_flags=-DUSE_BLUETOOTH=1" --library libraries/ModestIoT AliviaMicrophone
+```
 
 ### Credenciales: `Secrets.h`
 
 `AliviaMicrophone/Secrets.h` contiene el WiFi, el host del edge y el token. Está en `.gitignore` y **no se sube**; en el
 repo solo vive `Secrets.example.h`. Sin `Secrets.h` el sketch no compila. El token debe ser igual a `ALIVIA_WS_TOKEN` del
-edge. El puerto y la ruta (`/ws`) están en `MicrophoneConfig.h`.
+edge. El puerto y la ruta (`/ws`) están en el sketch.
+
+### Identificación por MAC
+
+El `hello` lleva la MAC base del ESP32, que el sketch imprime al arrancar. Regístrala en el backend como MICROPHONE en
+estado IN_USE o el edge rechazará la conexión.
 
 ## Cómo funciona
 
 ```
-INMP441 ──I2S──> captura (core 1) ──cola de 25 frames──> MicStream (core 0) ──ws /ws──> edge de voz
-parlante <──I2S── Playback (core 0) <──jitter buffer 500 ms── EdgeLink (core 0) <──ws /ws── edge de voz
+INMP441 ──I2S──> captura (core 1) ──cola de 25 frames──> uplink (core 0) ──ws /ws o SPP──> edge de voz
+parlante <──I2S── Max98357Speaker (core 0) <──jitter buffer 500 ms── StreamGatewayClient (core 0) <── edge de voz
 ```
 
-- **EdgeLink** conecta WiFi, abre el WebSocket, envía el `hello`, espera `ready` y reconecta con backoff de 1 s a 10 s.
-  Pings cada 10 s; tres sin respuesta cierran el enlace. Al caer, el parlante corta el sonido y vacía sus buffers.
-- **AudioStreamer** agrupa 2 frames de 20 ms (1280 bytes) por mensaje. Sin enlace descarta el audio y lo cuenta: nunca
-  lo acumula. Si la cola de 25 frames se llena, el micrófono descarta el frame más viejo (cuenta en `cola del mic`).
-- **Max98357Speaker** (actuador al estilo ModestIoT) guarda el audio en un jitter buffer, empieza a sonar tras 200 ms de
-  prefill, rellena con silencio si el audio se retrasa (underrun) y envía `playback_done` cuando la última muestra ya
-  sonó. `audio_cancel` corta el sonido; lo que ya está en el DMA (hasta ~90 ms) termina de sonar.
-- La telemetría (`voice_activity`, `audio_level`) sale por Serial **y** por el WebSocket cuando hay enlace.
+- **StreamGatewayClient** (WiFi: `WebSocketGatewayClient`, Bluetooth: `BluetoothStreamGatewayClient`) abre el enlace,
+  envía el `hello`, espera `ready` y reconecta con backoff de 1 s a 10 s. Pings cada 10 s; tres sin respuesta cierran
+  el enlace. Al caer, el parlante corta el sonido y vacía sus buffers.
+- **VoiceNodeDevice** agrupa 2 frames de 20 ms (1280 bytes) por mensaje. Sin enlace descarta el audio y lo cuenta: nunca
+  lo acumula. Si la cola de 25 frames se llena, el micrófono descarta el frame más viejo.
+- **Max98357Speaker** guarda el audio en un jitter buffer, empieza a sonar tras 200 ms de prefill, rellena con silencio
+  si el audio se retrasa (underrun) y envía `playback_done` cuando la última muestra ya sonó.
+- La telemetría (`voice_activity`, `audio_level`) sale por Serial **y** por el enlace cuando está activo.
 
 ## Probar el enlace
 
@@ -106,4 +114,4 @@ Con WiFi activo hay menos RAM libre, y `r`/`R` reservan el bloque libre más gra
 El enlace añade la pila de WiFi, la cola del micrófono (25 frames = 16 KB), el jitter buffer del parlante (16 KB) y las
 pilas de tres tareas nuevas, así que el bloque disponible baja y la grabación se acorta: es esperado, no un fallo.
 **No lo he medido en la placa** (solo compilé el firmware): arranca el ESP32 y escribe `s` y `w` para ver `heap libre` y
-`bloque mayor`, y compáralo con `r`. Si necesitas 3 s completos, baja `SPEAKER_BUFFER_MS` o `MIC_QUEUE_FRAMES`.
+`bloque mayor`, y compáralo con `r`. Si necesitas 3 s completos, baja `SpeakerSettings::bufferMs` o `VoiceNodeSettings::micQueueFrames`.
