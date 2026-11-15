@@ -12,17 +12,21 @@ Este archivo es idéntico en `alivia-control-edge-service` y en `embebido`: si c
 Primer mensaje que envía el ESP32 tras conectar (el edge espera 5 s como máximo):
 
 ```json
-{"type":"hello","deviceId":"alivia-mic-01","capabilities":["microphone","speaker"],
+{"type":"hello","deviceId":"alivia-mic-01","mac":"AA:BB:CC:DD:EE:FF","capabilities":["microphone","speaker"],
  "micSampleRate":16000,"playbackSampleRate":16000,"bits":16,"channels":1,
  "frameSamples":320,"token":"..."}
 ```
 
-El edge valida el token, `micSampleRate` = 16000, `bits` = 16, `channels` = 1 y responde:
+`mac` es la MAC base del ESP32 e identifica al dispositivo: el edge la busca en la tabla de acceso del backend (tipo
+MICROPHONE, estado IN_USE). Sin `mac` el edge rechaza el `hello`. `deviceId` solo es una etiqueta para los logs.
+
+El edge valida el token, la `mac`, `micSampleRate` = 16000, `bits` = 16, `channels` = 1 y responde:
 
 - `{"type":"ready"}`: el enlace queda activo.
 - `{"type":"error","reason":"..."}` y cierra la conexión. Razones: `bad_hello`, `unauthorized`, `unsupported_format`, `hello_timeout`.
 
-Si el mismo `deviceId` se conecta de nuevo, el edge cierra la conexión anterior.
+Si el mismo dispositivo se conecta de nuevo, el edge cierra la conexión anterior. Si el backend le retira el acceso
+con la sesión abierta, el edge la corta.
 
 ## 2. Micrófono (ESP32 → edge)
 
