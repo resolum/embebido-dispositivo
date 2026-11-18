@@ -27,6 +27,8 @@ void StreamGatewayClient::baseMacAddress(char* destination, size_t capacity) {
 
 void StreamGatewayClient::setListener(AudioLinkListener* newListener) { listener = newListener; }
 
+void StreamGatewayClient::setProtocolDelegate(LinkProtocolDelegate* newDelegate) { delegate = newDelegate; }
+
 bool StreamGatewayClient::begin() {
     if (taskHandle != nullptr) return true;
     ioLock = xSemaphoreCreateMutex();
@@ -128,6 +130,7 @@ void StreamGatewayClient::notifyDown() {
     if (announcedDown) return;
     announcedDown = true;
     if (listener != nullptr) listener->onLinkDown();
+    if (delegate != nullptr) delegate->onLinkDown();
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +158,14 @@ void StreamGatewayClient::sendHello() {
         baseMacAddress(mac, sizeof(mac));
     }
     document["mac"] = mac;
+    document["token"] = config.token;
+    if (delegate != nullptr) {
+        delegate->fillHello(document);  // the node adds its own capabilities and fields
+        String json;
+        serializeJson(document, json);
+        transportSendText(json.c_str(), json.length());
+        return;
+    }
     JsonArray capabilities = document["capabilities"].to<JsonArray>();
     capabilities.add("microphone");
     capabilities.add("speaker");
@@ -163,7 +174,6 @@ void StreamGatewayClient::sendHello() {
     document["bits"] = 16;
     document["channels"] = 1;
     document["frameSamples"] = config.frameSamples;
-    document["token"] = config.token;
     String json;
     serializeJson(document, json);
     // The I/O lock is already held by the link task: call the transport directly.
@@ -181,9 +191,12 @@ void StreamGatewayClient::onTransportText(const uint8_t* payload, size_t length)
         announcedDown = false;
         backoffMs = config.backoffMinMs;
         SerialConsole::printf("[Enlace] enlace listo con el edge (%s)\n", transportName());
+        if (delegate != nullptr) delegate->onLinkReady(document);
     } else if (strcmp(type, "error") == 0) {
         SerialConsole::printf("[Enlace] el edge rechazo el hello: %s\n", document["reason"] | "?");
         teardownRequested = true;  // the teardown applies the backoff
+    } else if (delegate != nullptr && linkState == LinkState::READY) {
+        delegate->onText(type, document);
     } else if (listener == nullptr || linkState != LinkState::READY) {
         return;
     } else if (strcmp(type, "audio_begin") == 0) {

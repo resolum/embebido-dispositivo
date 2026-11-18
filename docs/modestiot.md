@@ -57,3 +57,12 @@ Con `arduino-cli` también sirve `--library libraries/ModestIoT`, que tiene prio
 
 Con WiFi queda poco margen de flash en la partición `default`; si crece, usar `huge_app`. El heap en ejecución no
 está medido en la placa: los comandos `s` y `w` muestran `heap libre` y `bloque mayor`.
+
+## LinkProtocolDelegate (nodos que no son de voz)
+
+`StreamGatewayClient::setProtocolDelegate()` permite que otro tipo de nodo, como el ESP32 de actuadores
+(`embebido-actuador`), use el mismo enlace (WiFi/WebSocket o Bluetooth, reintentos y candado de envío) con su propio
+protocolo. Con un delegado, el `hello` lleva `type`, `deviceId`, `mac` y `token`, y el delegado agrega el resto
+(`fillHello`); el `ready` del edge llega a `onLinkReady`, cualquier otro mensaje a `onText`, y la caída del enlace a
+`onLinkDown`. Sin delegado, el enlace se comporta como antes (nodo de voz). Los callbacks corren en la tarea del
+enlace con el candado tomado: no deben llamar a `sendText()`.
