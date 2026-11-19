@@ -29,6 +29,7 @@
 #include "MqttGatewayClient.h"
 #include "AudioLink.h"
 #include "StreamFrameCodec.h"
+#include "LinkProtocolDelegate.h"
 #include "StreamGatewayClient.h"
 #include "WebSocketGatewayClient.h"
 #include "BluetoothStreamGatewayClient.h"

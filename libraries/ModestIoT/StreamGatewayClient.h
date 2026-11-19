@@ -12,6 +12,7 @@
  *     playback_done, JSON telemetry,
  *   - a mutex that serialises sends from other tasks and fails fast when the link is down,
  *   - counters and the listener (speaker) notifications.
+ * Other kinds of nodes (e.g. actuators) plug their own hello and messages in with a LinkProtocolDelegate.
  * Subclasses only implement the transport hooks (transport*): how to open, pump, close and send bytes.
  * The edge side (Windows or macOS) is the same for the ESP32: only the PC's serial-port name differs.
  *
@@ -21,6 +22,7 @@
 #include <Arduino.h>
 #include "AudioLink.h"
 #include "GatewayClient.h"
+#include "LinkProtocolDelegate.h"
 
 class StreamGatewayClient : public GatewayClient, public PlaybackReporter {
 public:
@@ -46,6 +48,8 @@ public:
     ~StreamGatewayClient() override;
 
     void setListener(AudioLinkListener* newListener);
+    /** @brief Lets another kind of node build its own hello and receive the edge's messages (see LinkProtocolDelegate). */
+    void setProtocolDelegate(LinkProtocolDelegate* newDelegate);
 
     /** @brief Writes the ESP32 base MAC ("AA:BB:CC:DD:EE:FF", 18 bytes with the terminator). Same value the hello carries. */
     static void baseMacAddress(char* destination, size_t capacity);
@@ -119,6 +123,7 @@ private:
     void sendHello();
 
     AudioLinkListener* listener = nullptr;
+    LinkProtocolDelegate* delegate = nullptr;
     SemaphoreHandle_t ioLock = nullptr;
     TaskHandle_t taskHandle = nullptr;
 

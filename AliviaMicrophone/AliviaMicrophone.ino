@@ -33,10 +33,14 @@
  *   - Monitor serie a 115200 baudios. Comandos: h ayuda, s estado, v vumetro, j JSON, + / - ganancia,
  *     w enlace, t tono de prueba, r prueba de 3 s, R WAV (tools/grabar_wav.py).
  *
+ * Bateria (opcional): divisor de voltaje en BATTERY_PIN; se envia en {"type":"telemetry","batteryPct":..} cada minuto.
+ *
  * Sin el dispositivo: tools/simulate_node.py del edge hace de este ESP32 (mismo protocolo).
  */
 
 #include <ModestIoT.h>
+
+#include "BatteryMonitor.h"
 
 // ---------------------------------------------------------------------------
 // Configuracion
@@ -62,6 +66,14 @@ static constexpr int MICROPHONE_SD_PIN  = 2;
 static constexpr int SPEAKER_BCLK_PIN   = 26;
 static constexpr int SPEAKER_LRC_PIN    = 25;
 static constexpr int SPEAKER_DIN_PIN    = 22;
+
+// Bateria (opcional): BAT+ -> 100k -> BATTERY_PIN -> 100k -> GND. -1 = sin bateria (la telemetria sale sin ella).
+// Se informa al edge cada TELEMETRY_INTERVAL_MS; el edge avisa al familiar cuando baja del 20 %. Ver BatteryMonitor.h.
+// BATTERY_SIMULATED_PCT >= 0 envia ese porcentaje sin leer el pin (para probar sin bateria).
+static constexpr int   BATTERY_PIN            = 35;
+static constexpr float BATTERY_DIVIDER_RATIO  = 2.0f;
+static constexpr int   BATTERY_SIMULATED_PCT  = -1;
+static constexpr unsigned long TELEMETRY_INTERVAL_MS = 60000;
 
 // Audio: debe coincidir con el edge (PCM 16 kHz, 16 bit, mono)
 static constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;
@@ -92,6 +104,32 @@ WebSocketGatewayClient edgeLink(connectivity, EDGE_HOST, EDGE_PORT, EDGE_PATH, l
 Inmp441Microphone microphone(MICROPHONE_SCK_PIN, MICROPHONE_WS_PIN, MICROPHONE_SD_PIN, AUDIO_SAMPLE_RATE);
 Max98357Speaker speaker(SPEAKER_BCLK_PIN, SPEAKER_LRC_PIN, SPEAKER_DIN_PIN, AUDIO_SAMPLE_RATE);
 VoiceNodeDevice voiceNode(DEVICE_ID, microphone, speaker, edgeLink, SCHEDULER_TICK_MS);
+alivia::BatteryMonitor batteryMonitor(BATTERY_PIN, BATTERY_DIVIDER_RATIO);
+
+// Telemetria de bateria hacia el edge de voz: al conectarse y luego cada TELEMETRY_INTERVAL_MS.
+static bool telemetrySent = false;
+static unsigned long lastTelemetryMs = 0;
+
+static void sendBatteryTelemetryWhenDue() {
+    if (!edgeLink.isReady()) {
+        telemetrySent = false;  // al reconectar se informa de nuevo
+        return;
+    }
+    const unsigned long now = millis();
+    if (telemetrySent && now - lastTelemetryMs < TELEMETRY_INTERVAL_MS) return;
+    const alivia::BatteryReading reading = batteryMonitor.read();
+#if USE_BLUETOOTH
+    const int rssi = 0;
+#else
+    const int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+#endif
+    char json[192];
+    if (alivia::TelemetryBuilder::build(json, sizeof(json), now, ESP.getFreeHeap(), rssi, reading) == 0) return;
+    if (!edgeLink.sendText(json)) return;
+    telemetrySent = true;
+    lastTelemetryMs = now;
+    if (reading.present) SerialConsole::printf("[Bateria] %d mV, %d %%\n", reading.millivolts, reading.percent);
+}
 
 // ---------------------------------------------------------------------------
 void setup() {
@@ -106,6 +144,8 @@ void setup() {
 #else
     SerialConsole::printf("Transporte: WiFi \"%s\" -> ws://%s:%u%s\n", WIFI_SSID, EDGE_HOST, (unsigned)EDGE_PORT, EDGE_PATH);
 #endif
+    batteryMonitor.begin();
+    if (BATTERY_SIMULATED_PCT >= 0) batteryMonitor.simulate(BATTERY_SIMULATED_PCT);
     voiceNode.begin();
 }
 
@@ -115,5 +155,6 @@ void loop() {
         return;
     }
     voiceNode.service();
+    sendBatteryTelemetryWhenDue();
     delay(10);
 }
